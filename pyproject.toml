@@ -1,7 +1,7 @@
 [project]
 name = "deriv-backend"
 version = "0.1.0"
-description = "Backend para robôs de trading e ingestão na Deriv"
+description = "Backend para robos de trading e ingestao na Deriv"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -13,6 +13,10 @@ dependencies = [
     "alembic==1.17.2",
     "sqlalchemy==2.0.48",
     "websockets>=14,<16",
+    "pwdlib[argon2]>=0.2,<1",
+    "PyJWT>=2.10,<3",
+    "email-validator>=2.2,<3",
+    "cryptography>=44,<48",
 ]
 
 [project.optional-dependencies]

@@ -1,4 +1,5 @@
-from pydantic import computed_field
+
+from pydantic import computed_field, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,17 +21,41 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "deriv_db"
     POSTGRES_USER: str = "deriv_user"
-    POSTGRES_PASSWORD: str = "deriv_pass"
+    POSTGRES_PASSWORD: str
     POSTGRES_MIN_POOL_SIZE: int = 2
     POSTGRES_MAX_POOL_SIZE: int = 10
     POSTGRES_TIMEOUT_SECONDS: float = 5.0
 
-    # Deriv market data
+    # Deriv Market Data
     DERIV_WS_URL: str = "wss://api.derivws.com/trading/v1/options/ws/public"
-    DERIV_SYMBOLS: str = "1HZ100V"
     DERIV_RECONNECT_DELAY_SECONDS: float = 2.0
     DERIV_BATCH_SIZE: int = 500
     DERIV_FLUSH_INTERVAL_SECONDS: float = 0.5
+    DERIV_SYMBOLS: str = "1HZ100V,R_100"
+
+    # Deriv OAuth2
+    DERIV_OAUTH_CLIENT_ID: str = ""
+    DERIV_OAUTH_REDIRECT_URI: str = (
+        "http://localhost:8000/auth/deriv/callback"
+    )
+    DERIV_OAUTH_SCOPE: str = "trade"
+    DERIV_OAUTH_AUTH_URL: str = (
+        "https://auth.deriv.com/oauth2/auth"
+    )
+    DERIV_OAUTH_TOKEN_URL: str = (
+        "https://auth.deriv.com/oauth2/token"
+    )
+
+    # Platform Authentication
+    JWT_SECRET_KEY: str = Field(min_length=32)
+    JWT_ALGORITHM: str = "HS256"
+    JWT_ACCESS_TOKEN_MINUTES: int = 15
+
+    # Data Encryption
+    DATA_ENCRYPTION_KEY: str
+
+    # Email Verification
+    EMAIL_VERIFICATION_TOKEN_MINUTES: int = 1440
 
     @computed_field
     @property

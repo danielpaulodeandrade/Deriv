@@ -714,3 +714,155 @@ async def test_stop_cleans_state_when_websocket_close_fails():
     assert service._writer_task is None
     assert service._consumer_task is None
     assert service._recovery_task is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_paginates_more_than_one_history_page(monkeypatch):
+    service = create_service()
+    service._queue = asyncio.Queue()
+    service._last_error = None
+    service._last_persisted_candle_epoch = AsyncMock(return_value=0)
+
+    page_size = DerivMarketData.HISTORY_PAGE_SIZE
+    first_epoch = 1_000_000
+    second_page_epoch = first_epoch - 10 * 60
+
+    first_page = [
+        {
+            "epoch": first_epoch + index * 60,
+            "open": "1.10",
+            "high": "1.20",
+            "low": "1.05",
+            "close": "1.15",
+        }
+        for index in range(page_size)
+    ]
+
+    second_page = [
+        {
+            "epoch": second_page_epoch + index * 60,
+            "open": "1.10",
+            "high": "1.20",
+            "low": "1.05",
+            "close": "1.15",
+        }
+        for index in range(10)
+    ]
+
+    responses = [first_page, second_page]
+    requests = []
+
+    class PaginatedWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def send(self, message):
+            requests.append(json.loads(message))
+
+        async def recv(self):
+            response = responses.pop(0)
+            return json.dumps({
+                "req_id": DerivMarketData.HISTORY_REQUEST_ID,
+                "msg_type": "candles",
+                "candles": response,
+            })
+
+    monkeypatch.setattr(
+        market_data_module,
+        "connect",
+        lambda *args, **kwargs: PaginatedWebSocket(),
+    )
+
+    await service._recover_missing_candles({"R_100": 0})
+
+    assert len(requests) == 2
+    assert requests[0]["end"] == "latest"
+    assert requests[1]["end"] == first_epoch - 1
+
+    assert service._queue.qsize() == page_size + 10
+    assert service._recovered_candles == page_size + 10
+    assert responses == []
+
+    queued_items = []
+
+    while not service._queue.empty():
+        queued_items.append(service._queue.get_nowait())
+
+    candle_epochs = [
+        int(item[2].timestamp())
+        for item in queued_items
+    ]
+
+    assert len(candle_epochs) == 5010
+    assert len(set(candle_epochs)) == 5010
+
+    sorted_epochs = sorted(candle_epochs)
+
+    assert all(
+        current - previous == 60
+        for previous, current in zip(
+            sorted_epochs,
+            sorted_epochs[1:],
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_recovery_without_persisted_cursor(monkeypatch):
+    service = create_service()
+    service._last_persisted_candle_epoch = AsyncMock(return_value=None)
+
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    candle_epoch = (now_epoch // 60 - 2) * 60
+
+    response = {
+        "req_id": DerivMarketData.HISTORY_REQUEST_ID,
+        "msg_type": "candles",
+        "candles": [
+            {
+                "epoch": candle_epoch,
+                "open": "1.10",
+                "high": "1.20",
+                "low": "1.05",
+                "close": "1.15",
+            },
+        ],
+    }
+
+
+    fake_ws = FakeWebSocket(response)
+
+    monkeypatch.setattr(
+        market_data_module,
+        "connect",
+        lambda *args, **kwargs: fake_ws,
+    )
+
+    before = int(datetime.now(timezone.utc).timestamp())
+
+    await service._recover_missing_candles({"R_100": None})
+
+    after = int(datetime.now(timezone.utc).timestamp())
+
+    request = fake_ws.sent_messages[0]
+
+    expected_start_min = before - service.HISTORY_DAYS * 86400
+    expected_start_max = after - service.HISTORY_DAYS * 86400
+
+    assert expected_start_min <= request["start"] <= expected_start_max
+    assert request["end"] == "latest"
+    assert request["ticks_history"] == "R_100"
+    assert request["style"] == "candles"
+    assert request["granularity"] == 60
+
+    assert service._recovered_candles == 1
+    assert service._queue.qsize() == 1
+
+    candle = service._queue.get_nowait()
+
+    assert candle[0] == "history"
+    assert candle[1] == "R_100"
+    assert int(candle[2].timestamp()) == candle_epoch
