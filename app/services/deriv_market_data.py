@@ -9,10 +9,11 @@ from websockets.asyncio.client import connect
 
 from app.core.config import settings
 from app.db.connection import get_db_pool
-from app.services.candle_builder import CandleBuilder
 
 logger = logging.getLogger(__name__)
 
+class InvalidHistoricalCandleError(ValueError):
+    """Raised when Deriv returns invalid historical candle data."""
 
 class DerivMarketData:
     HISTORY_PAGE_SIZE = 5000
@@ -32,11 +33,12 @@ class DerivMarketData:
         )
         self._stop = asyncio.Event()
         self._queue = asyncio.Queue(maxsize=50000)
-        self._candle_builder = CandleBuilder()
+        self._current_candles = {}
         self._connection = None
         self._consumer_task = None
         self._writer_task = None
         self._recovery_task = None
+        self._recovery_requested = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
         self._connected = False
         self._connected_at = None
@@ -59,36 +61,124 @@ class DerivMarketData:
                 logger.warning("No Deriv symbols configured. Market data disabled.")
                 return
 
-            writer_running = self._writer_task is not None and not self._writer_task.done()
-            consumer_running = self._consumer_task is not None and not self._consumer_task.done()
-            if writer_running and consumer_running:
+            tasks = (
+                self._writer_task,
+                self._consumer_task,
+                self._recovery_task,
+            )
+
+            running = [
+                task is not None and not task.done()
+                for task in tasks
+            ]
+
+            if all(running):
                 logger.warning("Deriv market data service is already running.")
                 return
-            if writer_running or consumer_running:
+
+            if any(running):
                 raise RuntimeError(
-                    "Deriv market data service is in a partial state. Call stop() before starting it again."
+                    "Deriv market data service is in a partial state. "
+                    "Call stop() before starting it again."
                 )
 
             self._stop.clear()
+            self._recovery_requested.set()
             self._started_at = datetime.now(timezone.utc)
-            self._writer_task = asyncio.create_task(
-                self._database_writer(), name="deriv-candle-writer"
-            )
+
             try:
-                self._consumer_task = asyncio.create_task(
-                    self._consume_ticks(), name="deriv-tick-consumer"
+                self._writer_task = asyncio.create_task(
+                    self._database_writer(),
+                    name="deriv-candle-writer",
                 )
+
+                self._consumer_task = asyncio.create_task(
+                    self._consume_ticks(),
+                    name="deriv-ohlc-consumer",
+                )
+
+                self._recovery_task = asyncio.create_task(
+                    self._history_recovery_worker(),
+                    name="deriv-candle-recovery",
+                )
+
             except Exception:
                 self._stop.set()
-                await self._writer_task
+
+                for task in (
+                    self._consumer_task,
+                    self._recovery_task,
+                ):
+                    if task is not None and not task.done():
+                        task.cancel()
+
+                await asyncio.gather(
+                    *(
+                        task for task in (
+                            self._writer_task,
+                            self._consumer_task,
+                            self._recovery_task,
+                        )
+                        if task is not None
+                    ),
+                    return_exceptions=True,
+                )
+
                 self._writer_task = None
+                self._consumer_task = None
+                self._recovery_task = None
                 raise
 
-            logger.info("Deriv market data service started: %s", self.symbols)
+            logger.info(
+                "Deriv market data service started: %s",
+                self.symbols,
+            )
+
+    async def _history_recovery_worker(self):
+        while not self._stop.is_set():
+            await self._recovery_requested.wait()
+
+            if self._stop.is_set():
+                break
+
+            self._recovery_requested.clear()
+
+            try:
+                # Aguarda a persistência dos candles recebidos ao vivo.
+                await self._queue.join()
+
+                if self._stop.is_set():
+                    break
+
+                await self._recover_missing_candles()
+
+            except asyncio.CancelledError:
+                raise
+
+            except InvalidHistoricalCandleError:
+                # O erro já foi registrado na recuperação do ativo.
+                # Aguarda uma nova solicitação de recuperação.
+                continue
+
+            except Exception:
+                self._last_error = "Unexpected history recovery worker failure"
+                logger.exception(
+                    "Unexpected history recovery worker failure. "
+                    "Retrying in 5 seconds."
+                )
+
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(),
+                        timeout=5,
+                    )
+                except asyncio.TimeoutError:
+                    self._recovery_requested.set()
 
     async def stop(self):
         async with self._lifecycle_lock:
             self._stop.set()
+
             connection = self._connection
             if connection is not None:
                 try:
@@ -97,21 +187,34 @@ class DerivMarketData:
                     logger.exception("Error while closing Deriv WebSocket.")
 
             consumer_task = self._consumer_task
+
             try:
                 if consumer_task is not None:
                     await consumer_task
             finally:
                 await self._cancel_recovery_task()
+
                 writer_task = self._writer_task
-                if writer_task is not None:
-                    # Do not cancel the writer: it may own an uncommitted batch.
-                    await writer_task
-                self._connection = None
-                self._connected = False
-                self._consumer_task = None
-                self._writer_task = None
-                self._recovery_task = None
-                self._candle_builder.reset()
+
+                try:
+                    if writer_task is not None:
+                        pending = self._queue.qsize()
+
+                        if pending:
+                            logger.info(
+                                "Service shutdown waiting for candle persistence. "
+                                "%d candles remain queued.",
+                                pending,
+                            )
+
+                        await writer_task
+                finally:
+                    self._connection = None
+                    self._connected = False
+                    self._consumer_task = None
+                    self._writer_task = None
+                    self._recovery_task = None
+                    self._current_candles.clear()
 
             logger.info("Deriv market data service stopped.")
 
@@ -129,10 +232,13 @@ class DerivMarketData:
 
     async def _consume_ticks(self):
         delay = settings.DERIV_RECONNECT_DELAY_SECONDS
+        has_connected = False
+
         try:
             while not self._stop.is_set():
                 try:
-                    logger.info("Connecting to Deriv public WebSocket.")
+                    logger.info("Connecting to Deriv live OHLC WebSocket.")
+
                     async with connect(
                         settings.DERIV_WS_URL,
                         ping_interval=20,
@@ -144,130 +250,166 @@ class DerivMarketData:
                         self._connected_at = datetime.now(timezone.utc)
                         self._last_error = None
                         delay = settings.DERIV_RECONNECT_DELAY_SECONDS
-                        self._candle_builder.reset()
-                        logger.info("Connected to Deriv WebSocket.")
+                        self._current_candles.clear()
 
-                        await self._cancel_recovery_task()
-                        if self._stop.is_set():
-                            break
+                        logger.info("Connected to Deriv live OHLC WebSocket.")
 
-                        # Read persisted cursors before live subscriptions, so live
-                        # writes cannot conceal a gap from the history recovery.
-                        recovery_cursors = {}
-                        for symbol in self.symbols:
-                            if self._stop.is_set():
-                                break
-                            recovery_cursors[symbol] = (
-                                await self._last_persisted_candle_epoch(symbol)
-                            )
-                        if self._stop.is_set():
-                            break
-
-                        # Subscribe first; recovery runs on a separate connection.
                         for req_id, symbol in enumerate(self.symbols, start=1):
                             if self._stop.is_set():
                                 break
+
                             await ws.send(
-                                json.dumps(
-                                    {"ticks": symbol, "subscribe": 1, "req_id": req_id}
-                                )
+                                json.dumps({
+                                    "ticks_history": symbol,
+                                    "style": "candles",
+                                    "granularity": self.GRANULARITY_SECONDS,
+                                    "subscribe": 1,
+                                    "req_id": req_id,
+                                })
                             )
-                            logger.info("Subscribed to ticks: %s", symbol)
 
-                        if self._stop.is_set():
-                            break
+                            logger.info(
+                                "Subscribed to OHLC candles: %s",
+                                symbol,
+                            )
 
-                        self._recovery_task = asyncio.create_task(
-                            self._recover_missing_candles(recovery_cursors),
-                            name="deriv-candle-recovery",
-                        )
+                        if has_connected:
+                            self._recovery_requested.set()
+
+                        has_connected = True
 
                         async for raw_message in ws:
                             if self._stop.is_set():
                                 break
+
                             await self._process_message(raw_message)
 
                         self._connection = None
                         self._connected = False
-                        self._candle_builder.reset()
+                        self._current_candles.clear()
+
                         if not self._stop.is_set():
-                            raise ConnectionError("Deriv WebSocket disconnected.")
+                            raise ConnectionError(
+                                "Deriv live OHLC WebSocket disconnected."
+                            )
 
                 except asyncio.CancelledError:
                     raise
+
                 except Exception:
                     self._connection = None
                     self._connected = False
-                    self._candle_builder.reset()
+                    self._current_candles.clear()
+
                     if self._stop.is_set():
                         break
+
                     self._connection_errors += 1
-                    self._last_error = "WebSocket connection failure"
+                    self._last_error = "Live OHLC WebSocket failure"
+
                     logger.exception(
-                        "Deriv connection failed. Reconnecting in %.1f seconds.", delay
+                        "Deriv live connection failed. "
+                        "Reconnecting in %.1f seconds.",
+                        delay,
                     )
+
                     try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                        await asyncio.wait_for(
+                            self._stop.wait(),
+                            timeout=delay,
+                        )
                     except asyncio.TimeoutError:
                         pass
+
                     delay = min(delay * 2, 60)
+
         finally:
             self._connection = None
             self._connected = False
-            self._candle_builder.reset()
-            await self._cancel_recovery_task()
+            self._current_candles.clear()
 
     async def _process_message(self, raw_message: str):
         try:
             message = json.loads(raw_message)
+
             if "error" in message:
                 logger.error("Deriv API error: %s", message["error"])
                 return
-            if message.get("msg_type") != "tick":
+
+            if message.get("msg_type") != "ohlc":
                 return
 
-            tick = message.get("tick") or {}
-            symbol = tick.get("symbol")
-            epoch_value = tick.get("epoch")
-            quote = tick.get("quote")
-            if not symbol or epoch_value is None or quote is None:
-                logger.warning("Incomplete tick received: %s", message)
-                return
+            ohlc = message.get("ohlc") or {}
+            symbol = ohlc.get("symbol")
+
             if symbol not in self.symbols:
                 logger.warning("Unexpected symbol received: %s", symbol)
                 return
 
-            epoch = int(epoch_value)
-            price = Decimal(str(quote))
-            if not price.is_finite() or price <= 0:
-                raise ValueError("Tick price must be finite and positive.")
+            open_time = int(ohlc["open_time"])
+            epoch = int(ohlc["epoch"])
+
+            prices = {
+                key: Decimal(str(ohlc[key]))
+                for key in ("open", "high", "low", "close")
+            }
+
+            values = tuple(prices.values())
+
+            if any(not value.is_finite() or value <= 0 for value in values):
+                raise ValueError("Invalid OHLC prices.")
+
+            if (
+                prices["high"] < max(prices["open"], prices["close"], prices["low"])
+                or prices["low"] > min(prices["open"], prices["close"], prices["high"])
+            ):
+                raise ValueError("Inconsistent OHLC prices.")
+
+            current = self._current_candles.get(symbol)
+
+            if current is not None:
+                previous_open_time = current["open_time"]
+
+                if open_time < previous_open_time:
+                    return
+
+                if open_time == previous_open_time:
+                    current.update(prices)
+                else:
+                    await self._queue.put((
+                        "live",
+                        symbol,
+                        datetime.fromtimestamp(previous_open_time, tz=timezone.utc),
+                        current["open"],
+                        current["high"],
+                        current["low"],
+                        current["close"],
+                    ))
+
+                    if open_time - previous_open_time > self.GRANULARITY_SECONDS:
+                        self._gap_events += 1
+
+                    self._current_candles[symbol] = {
+                        "open_time": open_time,
+                        **prices,
+                    }
+            else:
+                self._current_candles[symbol] = {
+                    "open_time": open_time,
+                    **prices,
+                }
 
             previous_epoch = self._last_tick_epoch.get(symbol)
-            if previous_epoch is not None and epoch > previous_epoch:
-                if epoch - previous_epoch > 5:
-                    self._gap_events += 1
+
+            if previous_epoch is not None and epoch - previous_epoch > 5:
+                self._gap_events += 1
+
             self._last_tick_epoch[symbol] = max(epoch, previous_epoch or epoch)
             self._last_tick_received_at[symbol] = datetime.now(timezone.utc)
             self._received_ticks += 1
 
-            completed = self._candle_builder.update(symbol, epoch, price)
-            if completed is not None:
-                await self._queue.put(self._candle_queue_item("live", completed))
-
-        except (ValueError, TypeError, InvalidOperation, OverflowError):
-            logger.exception("Invalid tick received.")
-
-    @staticmethod
-    def _candle_queue_item(source: str, candle):
-        return (
-            source,
-            candle.asset_symbol,
-            candle.candle_start,
-            candle.open,
-            candle.high,
-            candle.low,
-            candle.close,
-        )
+        except (ValueError, TypeError, KeyError, InvalidOperation, OverflowError):
+            logger.exception("Invalid OHLC message received.")
 
     async def _last_persisted_candle_epoch(self, symbol: str):
         pool = get_db_pool()
@@ -300,21 +442,40 @@ class DerivMarketData:
         while not self._stop.is_set():
             raw_message = await asyncio.wait_for(ws.recv(), timeout=30)
             message = json.loads(raw_message)
-            if message.get("req_id") != self.HISTORY_REQUEST_ID:
+
+            response_req_id = message.get("req_id")
+
+            # Ignora respostas identificadas como pertencentes a outra solicitação.
+            if (
+                response_req_id is not None
+                and response_req_id != self.HISTORY_REQUEST_ID
+            ):
                 continue
+
+            # Erros sem req_id ou com o req_id esperado devem ser tratados.
             if "error" in message:
-                raise RuntimeError(f"Candle history error for {symbol}: {message['error']}")
+                raise RuntimeError(
+                    f"Candle history error for {symbol}: {message['error']}"
+                )
+
+            # Só aceita candles vinculados à solicitação atual.
+            if response_req_id != self.HISTORY_REQUEST_ID:
+                continue
+
             if message.get("msg_type") != "candles":
                 continue
-            candles = message.get("candles") or []
-            return candles
+
+            return message.get("candles") or []
+
         return []
 
     async def _recover_missing_candles(
         self, cursors: dict[str, int | None] | None = None
     ):
         delay = settings.DERIV_RECONNECT_DELAY_SECONDS
-        while not self._stop.is_set():
+        symbol_index = 0
+
+        while not self._stop.is_set() and symbol_index < len(self.symbols):
             try:
                 async with connect(
                     settings.DERIV_WS_URL,
@@ -322,125 +483,254 @@ class DerivMarketData:
                     ping_timeout=20,
                     close_timeout=5,
                 ) as ws:
-                    delay = settings.DERIV_RECONNECT_DELAY_SECONDS
-                    for symbol in self.symbols:
-                        if self._stop.is_set():
-                            break
+                    while (
+                        not self._stop.is_set()
+                        and symbol_index < len(self.symbols)
+                    ):
+                        symbol = self.symbols[symbol_index]
 
-                        if cursors is None:
-                            last_epoch = await self._last_persisted_candle_epoch(symbol)
-                        else:
-                            last_epoch = cursors.get(symbol)
-
-                        if last_epoch is None:
-                            start = int(
-                                (datetime.now(timezone.utc) - timedelta(days=self.HISTORY_DAYS))
-                                .timestamp()
-                            )
-                            logger.info(
-                                "Initial candle history for %s: last %d days.",
-                                symbol,
-                                self.HISTORY_DAYS,
-                            )
-                        else:
-                            # Include the last saved candle for safe reconciliation.
-                            start = max(0, int(last_epoch) - self.GRANULARITY_SECONDS)
-                            logger.info(
-                                "Recovering candles for %s from epoch %d.", symbol, start
-                            )
-
-                        end = "latest"
-                        recovered = 0
-                        while not self._stop.is_set():
-                            candles = await self._request_history(ws, symbol, start, end)
-                            if not candles:
-                                break
-
-                            epochs = [int(item["epoch"]) for item in candles]
-                            earliest = min(epochs)
-                            current_minute = (
-                                int(datetime.now(timezone.utc).timestamp())
-                                // self.GRANULARITY_SECONDS
-                                * self.GRANULARITY_SECONDS
-                            )
-
-                            for item in candles:
-                                epoch = int(item["epoch"])
-                                candle_epoch = (
-                                    epoch - epoch % self.GRANULARITY_SECONDS
+                        try:
+                            if cursors is None:
+                                last_epoch = (
+                                    await self._last_persisted_candle_epoch(symbol)
                                 )
-                                if candle_epoch < start or candle_epoch >= current_minute:
-                                    continue
+                            else:
+                                last_epoch = cursors.get(symbol)
+
+                            if last_epoch is None:
+                                start = int(
+                                    (
+                                        datetime.now(timezone.utc)
+                                        - timedelta(days=self.HISTORY_DAYS)
+                                    ).timestamp()
+                                )
+                                logger.info(
+                                    "Initial candle history for %s: last %d days.",
+                                    symbol,
+                                    self.HISTORY_DAYS,
+                                )
+                            else:
+                                start = max(
+                                    0,
+                                    int(last_epoch) - self.GRANULARITY_SECONDS,
+                                )
+                                logger.info(
+                                    "Recovering candles for %s from epoch %d.",
+                                    symbol,
+                                    start,
+                                )
+
+                            end = "latest"
+                            recovered = 0
+
+                            while not self._stop.is_set():
+                                candles = await self._request_history(
+                                    ws, symbol, start, end
+                                )
+
+                                if not candles:
+                                    break
+
                                 try:
-                                    open_price = Decimal(str(item["open"]))
-                                    high_price = Decimal(str(item["high"]))
-                                    low_price = Decimal(str(item["low"]))
-                                    close_price = Decimal(str(item["close"]))
-                                except (KeyError, InvalidOperation, TypeError) as exc:
-                                    raise ValueError(
-                                        f"Invalid candle returned for {symbol}: {item}"
+                                    epochs = []
+
+                                    for item in candles:
+                                        epoch = item["epoch"]
+
+                                        if isinstance(epoch, bool) or not isinstance(epoch, int):
+                                            raise ValueError(f"Invalid epoch type: {epoch!r}")
+
+                                        if epoch <= 0:
+                                            raise ValueError(f"Invalid epoch value: {epoch}")
+
+                                        if epoch % self.GRANULARITY_SECONDS != 0:
+                                            raise ValueError(f"Epoch is not aligned to 60 seconds: {epoch}")
+
+                                        epochs.append(epoch)
+
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise InvalidHistoricalCandleError(
+                                        f"Invalid candle epoch returned for {symbol}: {candles}"
                                     ) from exc
 
-                                values = (open_price, high_price, low_price, close_price)
-                                if any(not value.is_finite() or value <= 0 for value in values):
-                                    raise ValueError(
-                                        f"Invalid OHLC values returned for {symbol}: {item}"
-                                    )
-                                if (
-                                    high_price < max(open_price, close_price, low_price)
-                                    or low_price > min(open_price, close_price, high_price)
-                                ):
-                                    raise ValueError(
-                                        f"Inconsistent OHLC values returned for {symbol}: {item}"
+                                earliest = min(epochs)
+
+                                current_minute = (
+                                    int(datetime.now(timezone.utc).timestamp())
+                                    // self.GRANULARITY_SECONDS
+                                    * self.GRANULARITY_SECONDS
+                                )
+
+                                for item, epoch in zip(candles, epochs):
+                                    candle_epoch = (
+                                        epoch - epoch % self.GRANULARITY_SECONDS
                                     )
 
-                                candle_start = datetime.fromtimestamp(
-                                    candle_epoch, tz=timezone.utc
-                                )
-                                await self._queue.put(
-                                    (
-                                        "history",
-                                        symbol,
-                                        candle_start,
+                                    if (
+                                        candle_epoch < start
+                                        or candle_epoch >= current_minute
+                                    ):
+                                        continue
+
+                                    try:
+                                        open_price = Decimal(str(item["open"]))
+                                        high_price = Decimal(str(item["high"]))
+                                        low_price = Decimal(str(item["low"]))
+                                        close_price = Decimal(str(item["close"]))
+                                    except (
+                                        KeyError,
+                                        InvalidOperation,
+                                        TypeError,
+                                        ValueError,
+                                    ) as exc:
+                                        raise InvalidHistoricalCandleError(
+                                            f"Invalid candle returned for "
+                                            f"{symbol}: {item}"
+                                        ) from exc
+
+                                    values = (
                                         open_price,
                                         high_price,
                                         low_price,
                                         close_price,
                                     )
-                                )
-                                recovered += 1
-                                self._recovered_candles += 1
 
-                            if earliest <= start or len(candles) < self.HISTORY_PAGE_SIZE:
+                                    if any(
+                                        not value.is_finite() or value <= 0
+                                        for value in values
+                                    ):
+                                        raise InvalidHistoricalCandleError(
+                                            f"Invalid OHLC values returned for "
+                                            f"{symbol}: {item}"
+                                        )
+
+                                    if (
+                                        high_price
+                                        < max(open_price, close_price, low_price)
+                                        or low_price
+                                        > min(open_price, close_price, high_price)
+                                    ):
+                                        raise InvalidHistoricalCandleError(
+                                            f"Inconsistent OHLC values returned "
+                                            f"for {symbol}: {item}"
+                                        )
+
+                                    try:
+                                        candle_start = datetime.fromtimestamp(
+                                            candle_epoch,
+                                            tz=timezone.utc,
+                                        )
+                                    except (OverflowError, OSError, ValueError) as exc:
+                                        raise InvalidHistoricalCandleError(
+                                            f"Invalid candle timestamp returned for "
+                                            f"{symbol}: {candle_epoch}"
+                                        ) from exc
+
+                                    await self._queue.put(
+                                        (
+                                            "history",
+                                            symbol,
+                                            candle_start,
+                                            open_price,
+                                            high_price,
+                                            low_price,
+                                            close_price,
+                                        )
+                                    )
+
+                                    recovered += 1
+                                    self._recovered_candles += 1
+
+                                if (
+                                    earliest <= start
+                                    or len(candles) < self.HISTORY_PAGE_SIZE
+                                ):
+                                    break
+
+                                next_end = earliest - 1
+
+                                if (
+                                    isinstance(end, int)
+                                    and next_end >= end
+                                ):
+                                    raise RuntimeError(
+                                        f"Candle history pagination made no progress for {symbol}."
+                                    )
+
+                                end = next_end
+
+                            if self._stop.is_set():
                                 break
 
-                            next_end = earliest - 1
-                            if isinstance(end, int) and next_end >= end:
-                                logger.warning(
-                                    "Candle history pagination made no progress for %s.",
-                                    symbol,
-                                )
-                                break
-                            end = next_end
+                            logger.info(
+                                "Candle history recovery completed for %s: "
+                                "%d candles queued.",
+                                symbol,
+                                recovered,
+                            )
 
-                        logger.info(
-                            "Candle history recovery completed for %s: %d candles queued.",
-                            symbol,
-                            recovered,
-                        )
-                    return
+                            # Só avança depois de concluir o ativo.
+                            symbol_index += 1
+
+                            # Um ativo concluído reinicia o backoff.
+                            delay = settings.DERIV_RECONNECT_DELAY_SECONDS
+
+                        except InvalidHistoricalCandleError:
+                            self._last_error = (
+                                f"Invalid historical candle data for {symbol}"
+                            )
+                            logger.exception(
+                                "Historical recovery stopped for %s: "
+                                "invalid candle data.",
+                                symbol,
+                            )
+                            raise
+
+                        except Exception:
+                            self._last_error = (
+                                f"Candle history recovery failure for {symbol}"
+                            )
+                            logger.exception(
+                                "Candle history recovery failed for %s. "
+                                "Reconnecting and retrying this asset.",
+                                symbol,
+                            )
+                            break
+
             except asyncio.CancelledError:
                 raise
+
+            except InvalidHistoricalCandleError:
+                raise
+
             except Exception:
-                self._last_error = "Candle history recovery failure"
-                logger.exception(
-                    "Candle history recovery failed. Retrying in %.1f seconds.", delay
+                symbol = (
+                    self.symbols[symbol_index]
+                    if symbol_index < len(self.symbols)
+                    else "unknown"
                 )
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
-                delay = min(delay * 2, 60)
+                self._last_error = (
+                    f"Candle history connection failure for {symbol}"
+                )
+                logger.exception(
+                    "Candle history connection failed for %s. "
+                    "Retrying in %.1f seconds.",
+                    symbol,
+                    delay,
+                )
+
+            if self._stop.is_set() or symbol_index >= len(self.symbols):
+                break
+
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=delay,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+            delay = min(delay * 2, 60)
 
     async def _database_writer(self):
         batch_size = settings.DERIV_BATCH_SIZE
@@ -468,7 +758,17 @@ class DerivMarketData:
             while True:
                 pool = get_db_pool()
                 if pool is None:
-                    logger.error("Database pool unavailable. Retrying candle batch.")
+                    if self._stop.is_set():
+                        logger.warning(
+                            "Service shutdown waiting for database availability. "
+                            "%d candles remain in the current batch.",
+                            len(batch),
+                        )
+                    else:
+                        logger.error(
+                            "Database pool unavailable. Retrying candle batch."
+                        )
+
                     await asyncio.sleep(2)
                     continue
                 try:
@@ -525,9 +825,19 @@ class DerivMarketData:
                 except Exception:
                     self._db_errors += 1
                     self._last_error = "Database persistence failure"
-                    logger.exception(
-                        "Failed to persist %d candles. Retrying.", len(batch)
-                    )
+
+                    if self._stop.is_set():
+                        logger.exception(
+                            "Service shutdown waiting for database recovery. "
+                            "Failed to persist %d candles. Retrying.",
+                            len(batch),
+                        )
+                    else:
+                        logger.exception(
+                            "Failed to persist %d candles. Retrying.",
+                            len(batch),
+                        )
+
                     await asyncio.sleep(2)
 
     def get_status(self):

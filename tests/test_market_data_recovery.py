@@ -79,7 +79,6 @@ def create_service():
     return service
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_recovery_queues_candles_from_persisted_cursor(
     monkeypatch,
 ):
@@ -155,6 +154,133 @@ async def test_recovery_queues_candles_from_persisted_cursor(
 
 
 @pytest.mark.asyncio
+async def test_request_history_ignores_unrelated_messages():
+    service = create_service()
+
+    expected_response = {
+        "req_id": service.HISTORY_REQUEST_ID,
+        "msg_type": "candles",
+        "candles": [],
+    }
+
+    messages = [
+        {
+            "req_id": 12345,
+            "msg_type": "candles",
+            "candles": [{"epoch": 60}],
+        },
+        {
+            "req_id": 12345,
+            "error": {"code": "InvalidSymbol", "message": "Unrelated error"},
+        },
+        expected_response,
+    ]
+
+    class FakeWS:
+        async def send(self, message):
+            self.request = json.loads(message)
+
+        async def recv(self):
+            return json.dumps(messages.pop(0))
+
+    ws = FakeWS()
+
+    result = await service._request_history(
+        ws,
+        "R_100",
+        60,
+        "latest",
+    )
+
+    assert result == []
+    assert len(messages) == 0
+    assert ws.request["ticks_history"] == "R_100"
+    assert ws.request["req_id"] == service.HISTORY_REQUEST_ID
+
+
+@pytest.mark.asyncio
+async def test_request_history_raises_error_without_request_id():
+    service = create_service()
+
+    class FakeWS:
+        async def send(self, message):
+            pass
+
+        async def recv(self):
+            return json.dumps({
+                "msg_type": "error",
+                "error": {
+                    "code": "InvalidSymbol",
+                    "message": "Invalid symbol",
+                },
+            })
+
+    with pytest.raises(RuntimeError, match="InvalidSymbol"):
+        await service._request_history(
+            FakeWS(),
+            "INVALID",
+            60,
+            "latest",
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_retries_only_failed_asset(monkeypatch):
+    service = create_service()
+    service.symbols = ["R_100", "1HZ100V", "frxEURUSD"]
+
+    connection_count = 0
+
+    def fake_connect(*args, **kwargs):
+        nonlocal connection_count
+        connection_count += 1
+        return FakeAsyncContext(object())
+
+    monkeypatch.setattr(
+        market_data_module,
+        "connect",
+        fake_connect,
+    )
+    monkeypatch.setattr(
+        market_data_module.settings,
+        "DERIV_RECONNECT_DELAY_SECONDS",
+        0,
+    )
+
+    service._request_history = AsyncMock(
+        side_effect=[
+            [],  # R_100 concluído
+            RuntimeError("Simulated history failure"),  # 1HZ100V falha
+            [],  # 1HZ100V recuperado na segunda tentativa
+            [],  # frxEURUSD concluído
+        ]
+    )
+
+    await service._recover_missing_candles(
+        {
+            "R_100": None,
+            "1HZ100V": None,
+            "frxEURUSD": None,
+        }
+    )
+
+    requested_symbols = [
+        call.args[1]
+        for call in service._request_history.await_args_list
+    ]
+
+    assert requested_symbols == [
+        "R_100",
+        "1HZ100V",
+        "1HZ100V",
+        "frxEURUSD",
+    ]
+
+    assert connection_count == 2
+    assert service._last_error == (
+        "Candle history recovery failure for 1HZ100V"
+    )
+
 @pytest.mark.asyncio
 async def test_database_writer_uses_conflict_protection(
     monkeypatch,
@@ -251,13 +377,14 @@ async def test_reconnect_restarts_connection_and_history_recovery(
 
     service.symbols = ["R_100"]
     service._stop = asyncio.Event()
+    service._recovery_requested = asyncio.Event()
     service._connection = None
     service._recovery_task = None
     service._connected = False
     service._connected_at = None
     service._connection_errors = 0
     service._last_error = None
-    service._candle_builder = CandleBuilder()
+    service._current_candles = {}
 
     # Simula o Ãºltimo tick persistido no banco.
     service._last_persisted_candle_epoch = AsyncMock(return_value=100)
@@ -308,14 +435,12 @@ async def test_reconnect_restarts_connection_and_history_recovery(
         )
 
     assert len(connections) == 2
-    assert recovery_calls == 2
-    assert service._last_persisted_candle_epoch.await_count == 2
+    assert service._recovery_requested.is_set()
     assert service._connection_errors == 1
     assert service._connected is False
     assert service._stop.is_set()
 
 
-@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_recovery_retries_after_websocket_failure(monkeypatch):
     service = create_service()
@@ -381,7 +506,6 @@ async def test_recovery_retries_after_websocket_failure(monkeypatch):
     assert service._last_persisted_candle_epoch.await_count == 2
     assert service._queue.qsize() == 2
     assert service._recovered_candles == 2
-
 
 @pytest.mark.asyncio
 async def test_database_writer_retries_failed_batch_without_losing_ticks(
@@ -480,30 +604,18 @@ async def test_database_writer_retries_failed_batch_without_losing_ticks(
     assert service._write_items == 2
     assert service._last_db_success_at is not None
 
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_live_and_recovery_candles_are_both_preserved():
     service = DerivMarketData.__new__(DerivMarketData)
 
     service.symbols = ["R_100"]
     service._queue = asyncio.Queue()
-    service._candle_builder = CandleBuilder()
+    service._current_candles = {}
     service._recovered_candles = 0
     service._received_ticks = 0
     service._last_tick_epoch = {}
     service._last_tick_received_at = {}
     service._gap_events = 0
 
-    # Prepara o builder para que o candle do minuto 120 seja fechado.
-    service._candle_builder.update(
-        "R_100", 60, Decimal("1.10")
-    )
-    service._candle_builder.update(
-        "R_100", 120, Decimal("1.20")
-    )
-
-    # Candle histórico recuperado.
     historical_candle = (
         "history",
         "R_100",
@@ -517,17 +629,35 @@ async def test_live_and_recovery_candles_are_both_preserved():
     await service._queue.put(historical_candle)
     service._recovered_candles += 1
 
-    # O tick no epoch 180 fecha o candle iniciado no epoch 120.
-    live_message = json.dumps({
-        "msg_type": "tick",
-        "tick": {
+    first_message = json.dumps({
+        "msg_type": "ohlc",
+        "ohlc": {
             "symbol": "R_100",
-            "epoch": 180,
-            "quote": "1.30",
+            "open_time": 120,
+            "epoch": 179,
+            "open": "1.20",
+            "high": "1.25",
+            "low": "1.18",
+            "close": "1.23",
         },
     })
 
-    await service._process_message(live_message)
+    await service._process_message(first_message)
+
+    second_message = json.dumps({
+        "msg_type": "ohlc",
+        "ohlc": {
+            "symbol": "R_100",
+            "open_time": 180,
+            "epoch": 180,
+            "open": "1.30",
+            "high": "1.30",
+            "low": "1.30",
+            "close": "1.30",
+        },
+    })
+
+    await service._process_message(second_message)
 
     queued_candles = []
 
@@ -547,15 +677,15 @@ async def test_live_and_recovery_candles_are_both_preserved():
     assert int(live_candle[2].timestamp()) == 120
     assert live_candle[3:] == (
         Decimal("1.20"),
-        Decimal("1.20"),
-        Decimal("1.20"),
-        Decimal("1.20"),
+        Decimal("1.25"),
+        Decimal("1.18"),
+        Decimal("1.23"),
     )
 
     assert service._recovered_candles == 1
-    assert service._received_ticks == 1
+    assert service._received_ticks == 2
     assert service._last_tick_epoch["R_100"] == 180
-
+    
 
 def create_lifecycle_service():
     service = DerivMarketData()
@@ -724,7 +854,7 @@ async def test_recovery_paginates_more_than_one_history_page(monkeypatch):
     service._last_persisted_candle_epoch = AsyncMock(return_value=0)
 
     page_size = DerivMarketData.HISTORY_PAGE_SIZE
-    first_epoch = 1_000_000
+    first_epoch = 1_000_020
     second_page_epoch = first_epoch - 10 * 60
 
     first_page = [
